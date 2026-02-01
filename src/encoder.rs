@@ -4,7 +4,7 @@ use crate::{
     encode,
     header::Header,
     iter::{SurfaceInfo, SurfaceIterator},
-    resize::{AlignedBuffer, Aligner, ResizeState},
+    resize::{AlignedBuffer, Aligner},
     ColorFormat, DataLayout, EncodeOptions, EncodingError, Format, ImageView, Progress,
     ProgressRange, Size,
 };
@@ -359,13 +359,11 @@ impl Default for MipmapOptions {
 
 struct MipmapCache {
     aligner: Aligner,
-    resizer: ResizeState,
 }
 impl MipmapCache {
     fn new() -> Self {
         Self {
             aligner: Aligner::new(),
-            resizer: ResizeState::new(),
         }
     }
 
@@ -445,11 +443,8 @@ impl MipmapCache {
 
         // otherwise, generate mipmaps sequentially
         for &mipmap_size in sizes {
-            let mipmap = self
-                .resizer
-                .resize(src, mipmap_size, straight_alpha, filter);
-
-            f(mipmap.as_image_view())?;
+            let mipmap = crate::resize::resize(src, mipmap_size, straight_alpha, filter);
+            f(mipmap.as_view().as_image_view())?;
         }
 
         Ok(())

@@ -1,8 +1,11 @@
-use crate::{cast, util, Channels, ColorFormat, ImageView, Precision, ResizeFilter, Size};
+use std::borrow::Cow;
 
-use resize::{Filter, Resizer};
+use crate::{
+    cast, util, Channels, ColorFormat, ImageView, Precision, ResizeFilter, Size, WithPrecision,
+};
 
 pub(crate) use aligned_types::*;
+use pic_scale_safe::{ImageSize, ResamplingFunction};
 
 mod aligned_types {
     use crate::{cast, resize::is_aligned, ColorFormat, ImageView, Size};
@@ -38,16 +41,30 @@ mod aligned_types {
         }
     }
 
+    pub(crate) enum Backing {
+        U8(Vec<u8>),
+        U16(Vec<u16>),
+        F32(Vec<f32>),
+    }
+    impl Backing {
+        pub fn as_bytes(&self) -> &[u8] {
+            match self {
+                Backing::U8(v) => cast::as_bytes(v),
+                Backing::U16(v) => cast::as_bytes(v),
+                Backing::F32(v) => cast::as_bytes(v),
+            }
+        }
+    }
+
     pub(crate) struct AlignedBuffer {
-        buffer: Vec<AlignTo>,
+        buffer: Backing,
         size: Size,
         color: ColorFormat,
     }
     impl AlignedBuffer {
-        pub fn new(buffer: Vec<AlignTo>, size: Size, color: ColorFormat) -> Self {
+        pub fn new(buffer: Backing, size: Size, color: ColorFormat) -> Self {
             debug_assert!(
-                buffer.len() * std::mem::size_of::<AlignTo>()
-                    >= color.buffer_size(size).expect("Invalid size"),
+                buffer.as_bytes().len() >= color.buffer_size(size).expect("Invalid size"),
                 "Buffer too small for aligned buffer"
             );
 
@@ -59,7 +76,7 @@ mod aligned_types {
         }
 
         pub fn as_view(&self) -> AlignedView<'_> {
-            let byte_slice = cast::as_bytes(&self.buffer);
+            let byte_slice = self.buffer.as_bytes();
             let len = self.color.buffer_size(self.size).expect("Invalid size");
 
             AlignedView {
@@ -111,49 +128,75 @@ impl Aligner {
     }
 }
 
-pub(crate) struct ResizeState {
-    dest_buffer: Vec<AlignTo>,
-}
-impl ResizeState {
-    pub fn new() -> Self {
-        Self {
-            dest_buffer: Vec::new(),
-        }
-    }
-
-    pub fn resize<'a>(
-        &'a mut self,
-        src: AlignedView,
-        new_size: Size,
-        straight_alpha: bool,
-        filter: ResizeFilter,
-    ) -> AlignedView<'a> {
-        let color = src.color();
-
-        // prepare the destination buffer
-        let dest_slice = get_aligned_slice(&mut self.dest_buffer, new_size, color);
-
-        resize_into(src, dest_slice, new_size, straight_alpha, filter);
-
-        AlignedView::new(dest_slice, new_size, color)
-    }
-}
-
 pub(crate) fn resize(
     src: AlignedView,
     new_size: Size,
     straight_alpha: bool,
     filter: ResizeFilter,
 ) -> AlignedBuffer {
-    let color = src.color();
+    let precision = src.color().precision;
 
-    // prepare the destination buffer
-    let mut dest_buffer: Vec<AlignTo> = Vec::new();
-    let dest_slice = get_aligned_slice(&mut dest_buffer, new_size, color);
+    match precision {
+        Precision::U8 => {
+            let typed_view: TypedView<u8> =
+                TypedView::new(src.view(), src.size(), src.color().channels);
+            resize_typed(typed_view, new_size, straight_alpha, filter)
+        }
+        Precision::U16 => {
+            let typed_view: TypedView<u16> = TypedView::new(
+                cast::from_bytes(src.view()).unwrap(),
+                src.size(),
+                src.color().channels,
+            );
+            resize_typed(typed_view, new_size, straight_alpha, filter)
+        }
+        Precision::F32 => {
+            let typed_view: TypedView<f32> = TypedView::new(
+                cast::from_bytes(src.view()).unwrap(),
+                src.size(),
+                src.color().channels,
+            );
+            resize_typed(typed_view, new_size, straight_alpha, filter)
+        }
+    }
+}
+fn resize_typed<P: Copy + WithResizeFn + ToBacking + WithPrecision + PremultipliedAlpha>(
+    src: TypedView<P>,
+    new_size: Size,
+    straight_alpha: bool,
+    filter: ResizeFilter,
+) -> AlignedBuffer {
+    let resize_fn = P::get_resize_fn(src.channels);
 
-    resize_into(src, dest_slice, new_size, straight_alpha, filter);
+    let needs_premultiply = straight_alpha && src.channels == Channels::Rgba;
 
-    AlignedBuffer::new(dest_buffer, new_size, color)
+    let src_buffer = if needs_premultiply {
+        let mut buf = src.source.to_vec();
+        P::premultiply_rgba(buf.as_mut_slice());
+        Cow::Owned(buf)
+    } else {
+        Cow::Borrowed(src.source)
+    };
+
+    let mut buffer = resize_fn(
+        src_buffer.as_ref(),
+        to_image_size(src.size),
+        to_image_size(new_size),
+        to_resampling_function(filter),
+    )
+    .unwrap();
+
+    if needs_premultiply {
+        P::unpremultiply_rgba(buffer.as_mut_slice());
+    }
+
+    let backing = P::to_backing(buffer);
+
+    AlignedBuffer::new(
+        backing,
+        new_size,
+        ColorFormat::new(src.channels, P::PRECISION),
+    )
 }
 
 fn get_aligned_slice(buffer: &mut Vec<AlignTo>, size: Size, color: ColorFormat) -> &mut [u8] {
@@ -173,401 +216,144 @@ fn is_aligned(slice: &[u8], alignment: usize) -> bool {
     (slice.as_ptr() as usize) % alignment == 0
 }
 
-fn resize_into(
-    src: AlignedView,
-    dest_slice: &mut [u8],
-    new_size: Size,
-    straight_alpha: bool,
-    filter: ResizeFilter,
-) {
-    let color = src.color();
+struct TypedView<'a, P> {
+    source: &'a [P],
+    size: Size,
+    channels: Channels,
+}
+impl<'a, P> TypedView<'a, P> {
+    pub fn new(source: &'a [P], size: Size, channels: Channels) -> Self {
+        debug_assert_eq!(
+            source.len(),
+            (size.width as usize)
+                .checked_mul(size.height as usize)
+                .and_then(|v| v.checked_mul(channels.count() as usize))
+                .expect("size too big for typed image")
+        );
 
-    debug_assert_eq!(
-        dest_slice.len(),
-        color
-            .buffer_size(new_size)
-            .expect("invalid size for destination slice")
-    );
-    debug_assert!(is_aligned(src.view(), color.precision.size() as usize));
-    debug_assert!(is_aligned(dest_slice, color.precision.size() as usize));
-
-    let args = Args {
-        src_size: src.size(),
-        src_bytes: src.view(),
-        dst_size: new_size,
-        dst_bytes: dest_slice,
-        filter,
-    };
-
-    use Channels as C;
-    use Precision as P;
-    match (color.precision, color.channels) {
-        (P::U8, C::Alpha | C::Grayscale) => resize_typed::<Pixel<[u8; 1]>>(args),
-        (P::U16, C::Alpha | C::Grayscale) => resize_typed::<Pixel<[u16; 1]>>(args),
-        (P::F32, C::Alpha | C::Grayscale) => resize_typed::<Pixel<[f32; 1]>>(args),
-        (P::U8, C::Rgb) => resize_typed::<Pixel<[u8; 3]>>(args),
-        (P::U16, C::Rgb) => resize_typed::<Pixel<[u16; 3]>>(args),
-        (P::F32, C::Rgb) => resize_typed::<Pixel<[f32; 3]>>(args),
-        (P::U8, C::Rgba) => {
-            if straight_alpha {
-                resize_typed::<StraightAlpha<[u8; 4]>>(args)
-            } else {
-                resize_typed::<Pixel<[u8; 4]>>(args)
-            }
-        }
-        (P::U16, C::Rgba) => {
-            if straight_alpha {
-                resize_typed::<StraightAlpha<[u16; 4]>>(args)
-            } else {
-                resize_typed::<Pixel<[u16; 4]>>(args)
-            }
-        }
-        (P::F32, C::Rgba) => {
-            if straight_alpha {
-                resize_typed::<StraightAlpha<[f32; 4]>>(args)
-            } else {
-                resize_typed::<Pixel<[f32; 4]>>(args)
-            }
+        Self {
+            source,
+            size,
+            channels,
         }
     }
 }
 
-struct Args<'a, 'b> {
-    src_size: Size,
-    src_bytes: &'a [u8],
-    dst_size: Size,
-    dst_bytes: &'b mut [u8],
-    filter: ResizeFilter,
+type ResizeFn<T> = fn(&[T], ImageSize, ImageSize, ResamplingFunction) -> Result<Vec<T>, String>;
+trait WithResizeFn: Sized {
+    fn get_resize_fn(channels: Channels) -> ResizeFn<Self>;
 }
-fn resize_typed<P>(
-    Args {
-        src_size,
-        src_bytes,
-        dst_size,
-        dst_bytes,
-        filter,
-    }: Args,
-) where
-    P: resize::PixelFormat + Default,
-    P::InputPixel: cast::Castable,
-    P::OutputPixel: cast::Castable,
-{
-    let src_slice: &[P::InputPixel] = cast::from_bytes(src_bytes).expect("invalid source data");
-    let dst_slice: &mut [P::OutputPixel] =
-        cast::from_bytes_mut(dst_bytes).expect("invalid destination data");
-
-    let mut resizes: Resizer<P> = resize::Resizer::new(
-        src_size.width as usize,
-        src_size.height as usize,
-        dst_size.width as usize,
-        dst_size.height as usize,
-        P::default(),
-        to_resize_filter_type(filter),
-    )
-    .expect("failed to create resizer");
-
-    resizes.resize(src_slice, dst_slice).expect("resize failed");
+impl WithResizeFn for u8 {
+    fn get_resize_fn(channels: Channels) -> ResizeFn<Self> {
+        match channels {
+            Channels::Alpha | Channels::Grayscale => pic_scale_safe::resize_plane8,
+            Channels::Rgb => pic_scale_safe::resize_rgb8,
+            Channels::Rgba => pic_scale_safe::resize_rgba8,
+        }
+    }
+}
+impl WithResizeFn for u16 {
+    fn get_resize_fn(channels: Channels) -> ResizeFn<Self> {
+        match channels {
+            Channels::Alpha | Channels::Grayscale => {
+                |source, source_size, destination_size, resampling_function| {
+                    pic_scale_safe::resize_plane16(
+                        source,
+                        source_size,
+                        destination_size,
+                        16,
+                        resampling_function,
+                    )
+                }
+            }
+            Channels::Rgb => |source, source_size, destination_size, resampling_function| {
+                pic_scale_safe::resize_rgb16(
+                    source,
+                    source_size,
+                    destination_size,
+                    16,
+                    resampling_function,
+                )
+            },
+            Channels::Rgba => |source, source_size, destination_size, resampling_function| {
+                pic_scale_safe::resize_rgba16(
+                    source,
+                    source_size,
+                    destination_size,
+                    16,
+                    resampling_function,
+                )
+            },
+        }
+    }
+}
+impl WithResizeFn for f32 {
+    fn get_resize_fn(channels: Channels) -> ResizeFn<Self> {
+        match channels {
+            Channels::Alpha | Channels::Grayscale => pic_scale_safe::resize_plane_f32,
+            Channels::Rgb => pic_scale_safe::resize_rgb_f32,
+            Channels::Rgba => pic_scale_safe::resize_rgba_f32,
+        }
+    }
 }
 
-fn to_resize_filter_type(filter: ResizeFilter) -> resize::Type {
+trait ToBacking: Sized {
+    fn to_backing(vec: Vec<Self>) -> Backing;
+}
+impl ToBacking for u8 {
+    fn to_backing(vec: Vec<Self>) -> Backing {
+        Backing::U8(vec)
+    }
+}
+impl ToBacking for u16 {
+    fn to_backing(vec: Vec<Self>) -> Backing {
+        Backing::U16(vec)
+    }
+}
+impl ToBacking for f32 {
+    fn to_backing(vec: Vec<Self>) -> Backing {
+        Backing::F32(vec)
+    }
+}
+
+trait PremultipliedAlpha: Sized {
+    fn premultiply_rgba(slice: &mut [Self]);
+    fn unpremultiply_rgba(slice: &mut [Self]);
+}
+impl PremultipliedAlpha for u8 {
+    fn premultiply_rgba(slice: &mut [Self]) {
+        pic_scale_safe::premultiply_rgba8(slice);
+    }
+    fn unpremultiply_rgba(slice: &mut [Self]) {
+        pic_scale_safe::unpremultiply_rgba8(slice);
+    }
+}
+impl PremultipliedAlpha for u16 {
+    fn premultiply_rgba(slice: &mut [Self]) {
+        pic_scale_safe::premultiply_rgba16(slice, 16);
+    }
+    fn unpremultiply_rgba(slice: &mut [Self]) {
+        pic_scale_safe::unpremultiply_rgba16(slice, 16);
+    }
+}
+impl PremultipliedAlpha for f32 {
+    fn premultiply_rgba(slice: &mut [Self]) {
+        pic_scale_safe::premultiply_rgba_f32(slice);
+    }
+    fn unpremultiply_rgba(slice: &mut [Self]) {
+        pic_scale_safe::unpremultiply_rgba_f32(slice);
+    }
+}
+
+fn to_image_size(size: Size) -> ImageSize {
+    ImageSize::new(size.width as usize, size.height as usize)
+}
+fn to_resampling_function(filter: ResizeFilter) -> ResamplingFunction {
     match filter {
-        ResizeFilter::Nearest => resize::Type::Point,
-        ResizeFilter::Box => resize::Type::Custom(Filter::box_filter(1.0)),
-        ResizeFilter::Triangle => resize::Type::Triangle,
-        ResizeFilter::Mitchell => resize::Type::Mitchell,
-        ResizeFilter::Lanczos3 => resize::Type::Lanczos3,
-    }
-}
-
-use pixel::{Pixel, StraightAlpha};
-mod pixel {
-    use glam::Vec4;
-
-    pub(crate) struct Pixel<T> {
-        _marker: std::marker::PhantomData<T>,
-    }
-    impl<T> Default for Pixel<T> {
-        fn default() -> Self {
-            Self {
-                _marker: std::marker::PhantomData,
-            }
-        }
-    }
-
-    pub(crate) trait SelectAccumulator {
-        type Accumulator: Accumulator;
-    }
-    pub(crate) struct Selector<const N: usize>;
-    impl SelectAccumulator for Selector<1> {
-        type Accumulator = f32;
-    }
-    impl SelectAccumulator for Selector<3> {
-        type Accumulator = Vec4;
-    }
-    impl SelectAccumulator for Selector<4> {
-        type Accumulator = Vec4;
-    }
-
-    pub(crate) trait Accumulator: Copy + Send + Sync {
-        fn zero() -> Self;
-        fn add_scaled(&mut self, input: Self, scale: f32);
-    }
-    impl Accumulator for f32 {
-        fn zero() -> Self {
-            0.0
-        }
-        fn add_scaled(&mut self, input: Self, scale: f32) {
-            *self += input * scale;
-        }
-    }
-    impl Accumulator for Vec4 {
-        fn zero() -> Self {
-            Vec4::ZERO
-        }
-        fn add_scaled(&mut self, input: Self, scale: f32) {
-            *self += input * scale;
-        }
-    }
-
-    pub(crate) trait IntoAccumulator<T> {
-        fn to_accumulator(self) -> T;
-        fn to_value(acc: T) -> Self;
-    }
-    impl IntoAccumulator<f32> for [u8; 1] {
-        fn to_accumulator(self) -> f32 {
-            self[0] as f32
-        }
-        fn to_value(acc: f32) -> Self {
-            [(acc + 0.5) as u8]
-        }
-    }
-    impl IntoAccumulator<f32> for [u16; 1] {
-        fn to_accumulator(self) -> f32 {
-            self[0] as f32
-        }
-        fn to_value(acc: f32) -> Self {
-            [(acc + 0.5) as u16]
-        }
-    }
-    impl IntoAccumulator<f32> for [f32; 1] {
-        fn to_accumulator(self) -> f32 {
-            self[0]
-        }
-        fn to_value(acc: f32) -> Self {
-            [acc]
-        }
-    }
-    impl IntoAccumulator<Vec4> for [u8; 3] {
-        fn to_accumulator(self) -> Vec4 {
-            Vec4::new(self[0] as f32, self[1] as f32, self[2] as f32, 0.0)
-        }
-        fn to_value(acc: Vec4) -> Self {
-            [
-                (acc.x + 0.5) as u8,
-                (acc.y + 0.5) as u8,
-                (acc.z + 0.5) as u8,
-            ]
-        }
-    }
-    impl IntoAccumulator<Vec4> for [u16; 3] {
-        fn to_accumulator(self) -> Vec4 {
-            Vec4::new(self[0] as f32, self[1] as f32, self[2] as f32, 0.0)
-        }
-        fn to_value(acc: Vec4) -> Self {
-            [
-                (acc.x + 0.5) as u16,
-                (acc.y + 0.5) as u16,
-                (acc.z + 0.5) as u16,
-            ]
-        }
-    }
-    impl IntoAccumulator<Vec4> for [f32; 3] {
-        fn to_accumulator(self) -> Vec4 {
-            Vec4::new(self[0], self[1], self[2], 0.0)
-        }
-        fn to_value(acc: Vec4) -> Self {
-            [acc.x, acc.y, acc.z]
-        }
-    }
-    impl IntoAccumulator<Vec4> for [u8; 4] {
-        fn to_accumulator(self) -> Vec4 {
-            Vec4::new(
-                self[0] as f32,
-                self[1] as f32,
-                self[2] as f32,
-                self[3] as f32,
-            )
-        }
-        fn to_value(acc: Vec4) -> Self {
-            [
-                (acc.x + 0.5) as u8,
-                (acc.y + 0.5) as u8,
-                (acc.z + 0.5) as u8,
-                (acc.w + 0.5) as u8,
-            ]
-        }
-    }
-    impl IntoAccumulator<Vec4> for [u16; 4] {
-        fn to_accumulator(self) -> Vec4 {
-            Vec4::new(
-                self[0] as f32,
-                self[1] as f32,
-                self[2] as f32,
-                self[3] as f32,
-            )
-        }
-        fn to_value(acc: Vec4) -> Self {
-            [
-                (acc.x + 0.5) as u16,
-                (acc.y + 0.5) as u16,
-                (acc.z + 0.5) as u16,
-                (acc.w + 0.5) as u16,
-            ]
-        }
-    }
-    impl IntoAccumulator<Vec4> for [f32; 4] {
-        fn to_accumulator(self) -> Vec4 {
-            Vec4::new(self[0], self[1], self[2], self[3])
-        }
-        fn to_value(acc: Vec4) -> Self {
-            [acc.x, acc.y, acc.z, acc.w]
-        }
-    }
-
-    impl<T, const N: usize> resize::PixelFormat for Pixel<[T; N]>
-    where
-        T: Send + Sync + Copy,
-        [T; N]: Default,
-        Selector<N>: SelectAccumulator,
-        [T; N]: IntoAccumulator<<Selector<N> as SelectAccumulator>::Accumulator>,
-    {
-        type InputPixel = [T; N];
-
-        type OutputPixel = [T; N];
-
-        type Accumulator = <Selector<N> as SelectAccumulator>::Accumulator;
-
-        fn new() -> Self::Accumulator {
-            Self::Accumulator::zero()
-        }
-
-        fn add(&self, acc: &mut Self::Accumulator, inp: Self::InputPixel, coeff: f32) {
-            acc.add_scaled(inp.to_accumulator(), coeff);
-        }
-
-        fn add_acc(acc: &mut Self::Accumulator, inp: Self::Accumulator, coeff: f32) {
-            acc.add_scaled(inp, coeff);
-        }
-
-        fn into_pixel(&self, acc: Self::Accumulator) -> Self::OutputPixel {
-            Self::OutputPixel::to_value(acc)
-        }
-    }
-
-    pub(crate) struct StraightAlpha<T> {
-        _marker: std::marker::PhantomData<T>,
-    }
-    impl<T> Default for StraightAlpha<T> {
-        fn default() -> Self {
-            Self {
-                _marker: std::marker::PhantomData,
-            }
-        }
-    }
-    pub(crate) trait IntoStraightAlphaAccumulator<T> {
-        fn to_accumulator(self) -> T;
-        fn to_value(acc: T) -> Self;
-    }
-    impl IntoStraightAlphaAccumulator<Vec4> for [u8; 4] {
-        fn to_accumulator(self) -> Vec4 {
-            let a = self[3] as f32;
-            Vec4::new(
-                self[0] as f32 * a,
-                self[1] as f32 * a,
-                self[2] as f32 * a,
-                a,
-            )
-        }
-        fn to_value(acc: Vec4) -> Self {
-            let a = acc.w;
-            let a_out = (a + 0.5) as u8;
-            if a_out == 0 {
-                return [0, 0, 0, 0];
-            }
-            let a_r = a.recip();
-            [
-                (acc.x * a_r + 0.5) as u8,
-                (acc.y * a_r + 0.5) as u8,
-                (acc.z * a_r + 0.5) as u8,
-                a_out,
-            ]
-        }
-    }
-    impl IntoStraightAlphaAccumulator<Vec4> for [u16; 4] {
-        fn to_accumulator(self) -> Vec4 {
-            let a = self[3] as f32;
-            Vec4::new(
-                self[0] as f32 * a,
-                self[1] as f32 * a,
-                self[2] as f32 * a,
-                a,
-            )
-        }
-        fn to_value(acc: Vec4) -> Self {
-            let a = acc.w;
-            let a_out = (a + 0.5) as u16;
-            if a_out == 0 {
-                return [0, 0, 0, 0];
-            }
-            let a_r = a.recip();
-            [
-                (acc.x * a_r + 0.5) as u16,
-                (acc.y * a_r + 0.5) as u16,
-                (acc.z * a_r + 0.5) as u16,
-                a_out,
-            ]
-        }
-    }
-    impl IntoStraightAlphaAccumulator<Vec4> for [f32; 4] {
-        fn to_accumulator(self) -> Vec4 {
-            let a = self[3];
-            Vec4::new(self[0] * a, self[1] * a, self[2] * a, a)
-        }
-        fn to_value(acc: Vec4) -> Self {
-            let a = acc.w;
-            if a == 0.0 {
-                return [0.0, 0.0, 0.0, 0.0];
-            }
-            let a_r = 1.0 / a.recip();
-            [acc.x * a_r, acc.y * a_r, acc.z * a_r, a]
-        }
-    }
-
-    impl<T> resize::PixelFormat for StraightAlpha<[T; 4]>
-    where
-        T: Send + Sync + Copy,
-        [T; 4]: Default + IntoStraightAlphaAccumulator<Vec4>,
-    {
-        type InputPixel = [T; 4];
-
-        type OutputPixel = [T; 4];
-
-        type Accumulator = Vec4;
-
-        fn new() -> Self::Accumulator {
-            Self::Accumulator::zero()
-        }
-
-        fn add(&self, acc: &mut Self::Accumulator, inp: Self::InputPixel, coeff: f32) {
-            acc.add_scaled(inp.to_accumulator(), coeff);
-        }
-
-        fn add_acc(acc: &mut Self::Accumulator, inp: Self::Accumulator, coeff: f32) {
-            acc.add_scaled(inp, coeff);
-        }
-
-        fn into_pixel(&self, acc: Self::Accumulator) -> Self::OutputPixel {
-            Self::OutputPixel::to_value(acc)
-        }
+        ResizeFilter::Nearest => ResamplingFunction::Nearest,
+        ResizeFilter::Box => ResamplingFunction::Area,
+        ResizeFilter::Triangle => ResamplingFunction::Bilinear,
+        ResizeFilter::Mitchell => ResamplingFunction::MitchellNetravalli,
+        ResizeFilter::Lanczos3 => ResamplingFunction::Lanczos3,
     }
 }
