@@ -168,7 +168,8 @@ fn resize_typed<P: Copy + WithResizeFn + ToBacking + WithPrecision + Premultipli
 ) -> AlignedBuffer {
     let resize_fn = P::get_resize_fn(src.channels);
 
-    let needs_premultiply = straight_alpha && src.channels == Channels::Rgba;
+    let needs_premultiply =
+        straight_alpha && src.channels == Channels::Rgba && filter != ResizeFilter::Nearest;
 
     let src_buffer = if needs_premultiply {
         let mut buf = src.source.to_vec();
