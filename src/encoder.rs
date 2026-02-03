@@ -5,7 +5,7 @@ use crate::{
     header::Header,
     iter::{SurfaceInfo, SurfaceIterator},
     resize::{AlignedBuffer, Aligner},
-    ColorFormat, DataLayout, EncodeOptions, EncodingError, Format, ImageView, Progress,
+    Channels, ColorFormat, DataLayout, EncodeOptions, EncodingError, Format, ImageView, Progress,
     ProgressRange, Size,
 };
 
@@ -458,24 +458,39 @@ impl MipmapCache {
         options: MipmapOptions,
         mut f: impl FnMut(ImageView) -> Result<(), EncodingError>,
     ) -> Result<(), EncodingError> {
-        let straight_alpha = options.resize_straight_alpha;
         let filter = options.resize_filter;
+        let premultiplied =
+            options.resize_straight_alpha && image.color().channels == Channels::Rgba;
 
-        let src = self.aligner.align(image);
+        let mut yield_mip = |mut buffer: AlignedBuffer| {
+            if premultiplied {
+                crate::resize::unpremultiply_rgba(&mut buffer);
+            }
+            f(buffer.as_view().as_image_view())
+        };
 
-        let first_mipmap = crate::resize::resize(src, sizes[0], straight_alpha, filter);
-        f(first_mipmap.as_view().as_image_view())?;
+        let mut src = self.aligner.align(image);
 
-        let mut prev_mipmap = first_mipmap;
+        let mut src_buffer;
+        if premultiplied {
+            src_buffer = AlignedBuffer::from_view(src);
+            crate::resize::premultiply_rgba(&mut src_buffer);
+            src = src_buffer.as_view();
+        }
+
+        // this mipmap always has premultiplied alpha
+        let mut prev_mipmap = crate::resize::base_resize(src, sizes[0], filter);
 
         for &mipmap_size in &sizes[1..] {
             let next_mipmap =
-                crate::resize::resize(prev_mipmap.as_view(), mipmap_size, straight_alpha, filter);
+                crate::resize::base_resize(prev_mipmap.as_view(), mipmap_size, filter);
 
-            f(next_mipmap.as_view().as_image_view())?;
+            yield_mip(prev_mipmap)?;
 
             prev_mipmap = next_mipmap;
         }
+
+        yield_mip(prev_mipmap)?;
 
         Ok(())
     }
@@ -488,37 +503,50 @@ impl MipmapCache {
         options: MipmapOptions,
         mut f: impl FnMut(ImageView) -> Result<(), EncodingError>,
     ) -> Result<(), EncodingError> {
-        let straight_alpha = options.resize_straight_alpha;
         let filter = options.resize_filter;
+        let premultiplied =
+            options.resize_straight_alpha && image.color().channels == Channels::Rgba;
 
-        let src = self.aligner.align(image);
+        let mut yield_mip = |mut buffer: AlignedBuffer| {
+            if premultiplied {
+                crate::resize::unpremultiply_rgba(&mut buffer);
+            }
+            f(buffer.as_view().as_image_view())
+        };
 
-        let first_mipmap = crate::resize::resize(src, sizes[0], straight_alpha, filter);
-        f(first_mipmap.as_view().as_image_view())?;
+        let mut src = self.aligner.align(image);
+
+        let mut src_buffer;
+        if premultiplied {
+            src_buffer = AlignedBuffer::from_view(src);
+            crate::resize::premultiply_rgba(&mut src_buffer);
+            src = src_buffer.as_view();
+        }
+
+        let first_mipmap = crate::resize::base_resize(src, sizes[0], filter);
 
         if sizes.len() == 1 {
+            yield_mip(first_mipmap)?;
             return Ok(());
         }
 
-        let second_mipmap = crate::resize::resize(src, sizes[1], straight_alpha, filter);
-        f(second_mipmap.as_view().as_image_view())?;
+        let second_mipmap = crate::resize::base_resize(src, sizes[1], filter);
 
         let mut prev_prev_mipmap = first_mipmap;
         let mut prev_mipmap = second_mipmap;
 
         for &mipmap_size in &sizes[2..] {
-            let next_mipmap = crate::resize::resize(
-                prev_prev_mipmap.as_view(),
-                mipmap_size,
-                straight_alpha,
-                filter,
-            );
+            let next_mipmap =
+                crate::resize::base_resize(prev_prev_mipmap.as_view(), mipmap_size, filter);
 
-            f(next_mipmap.as_view().as_image_view())?;
+            yield_mip(prev_prev_mipmap)?;
 
             prev_prev_mipmap = prev_mipmap;
             prev_mipmap = next_mipmap;
         }
+
+        yield_mip(prev_prev_mipmap)?;
+        yield_mip(prev_mipmap)?;
 
         Ok(())
     }

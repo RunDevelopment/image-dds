@@ -1,14 +1,10 @@
-use std::borrow::Cow;
-
-use crate::{
-    cast, util, Channels, ColorFormat, ImageView, Precision, ResizeFilter, Size, WithPrecision,
-};
+use crate::{cast, util, Channels, ColorFormat, ImageView, Precision, ResizeFilter, Size};
 
 pub(crate) use aligned_types::*;
 use pic_scale_safe::{ImageSize, ResamplingFunction};
 
 mod aligned_types {
-    use crate::{cast, resize::is_aligned, ColorFormat, ImageView, Size};
+    use crate::{cast, resize::is_aligned, Channels, ColorFormat, ImageView, Precision, Size};
 
     pub(crate) type AlignTo = u32;
 
@@ -54,35 +50,79 @@ mod aligned_types {
                 Backing::F32(v) => cast::as_bytes(v),
             }
         }
+        pub fn precision(&self) -> Precision {
+            match self {
+                Backing::U8(_) => Precision::U8,
+                Backing::U16(_) => Precision::U16,
+                Backing::F32(_) => Precision::F32,
+            }
+        }
+    }
+    impl From<Vec<u8>> for Backing {
+        fn from(v: Vec<u8>) -> Self {
+            Backing::U8(v)
+        }
+    }
+    impl From<Vec<u16>> for Backing {
+        fn from(v: Vec<u16>) -> Self {
+            Backing::U16(v)
+        }
+    }
+    impl From<Vec<f32>> for Backing {
+        fn from(v: Vec<f32>) -> Self {
+            Backing::F32(v)
+        }
     }
 
     pub(crate) struct AlignedBuffer {
-        buffer: Backing,
+        pub(crate) buffer: Backing,
         size: Size,
-        color: ColorFormat,
+        channels: Channels,
     }
     impl AlignedBuffer {
-        pub fn new(buffer: Backing, size: Size, color: ColorFormat) -> Self {
+        pub fn new(buffer: impl Into<Backing>, size: Size, channels: Channels) -> Self {
+            let buffer = buffer.into();
+
             debug_assert!(
-                buffer.as_bytes().len() >= color.buffer_size(size).expect("Invalid size"),
+                buffer.as_bytes().len()
+                    == ColorFormat::new(channels, buffer.precision())
+                        .buffer_size(size)
+                        .expect("Invalid size"),
                 "Buffer too small for aligned buffer"
             );
 
             Self {
                 buffer,
                 size,
-                color,
+                channels,
             }
         }
 
-        pub fn as_view(&self) -> AlignedView<'_> {
-            let byte_slice = self.buffer.as_bytes();
-            let len = self.color.buffer_size(self.size).expect("Invalid size");
+        pub fn from_view(view: AlignedView<'_>) -> Self {
+            let ColorFormat {
+                channels,
+                precision,
+            } = view.color();
+            let bytes = view.view();
 
+            let backing = match precision {
+                Precision::U8 => Backing::U8(bytes.to_vec()),
+                Precision::U16 => Backing::U16(cast::from_bytes(bytes).unwrap().to_vec()),
+                Precision::F32 => Backing::F32(cast::from_bytes(bytes).unwrap().to_vec()),
+            };
+
+            Self::new(backing, view.size(), channels)
+        }
+
+        pub fn color(&self) -> ColorFormat {
+            ColorFormat::new(self.channels, self.buffer.precision())
+        }
+
+        pub fn as_view(&self) -> AlignedView<'_> {
             AlignedView {
-                view: &byte_slice[..len],
+                view: self.buffer.as_bytes(),
                 size: self.size,
-                color: self.color,
+                color: self.color(),
             }
         }
     }
@@ -134,70 +174,75 @@ pub(crate) fn resize(
     straight_alpha: bool,
     filter: ResizeFilter,
 ) -> AlignedBuffer {
-    let precision = src.color().precision;
+    let needs_premultiply =
+        straight_alpha && src.color().channels == Channels::Rgba && filter != ResizeFilter::Nearest;
+
+    let src_buffer = if needs_premultiply {
+        let mut buf = AlignedBuffer::from_view(src);
+        premultiply_rgba(&mut buf);
+        Some(buf)
+    } else {
+        None
+    };
+
+    let src_view = src_buffer.as_ref().map(|b| b.as_view()).unwrap_or(src);
+
+    let mut buffer = base_resize(src_view, new_size, filter);
+
+    if needs_premultiply {
+        unpremultiply_rgba(&mut buffer);
+    }
+
+    buffer
+}
+
+pub(crate) fn base_resize(src: AlignedView, new_size: Size, filter: ResizeFilter) -> AlignedBuffer {
+    let ColorFormat {
+        channels,
+        precision,
+    } = src.color();
+
+    let src_size = to_image_size(src.size());
+    let dst_size = to_image_size(new_size);
+    let resample = to_resampling_function(filter);
 
     match precision {
         Precision::U8 => {
-            let typed_view: TypedView<u8> =
-                TypedView::new(src.view(), src.size(), src.color().channels);
-            resize_typed(typed_view, new_size, straight_alpha, filter)
+            let resize_fn = get_resize_fn_u8(channels);
+            let src_ref = src.view();
+            let buffer: Vec<u8> = resize_fn(src_ref, src_size, dst_size, resample).unwrap();
+            AlignedBuffer::new(buffer, new_size, channels)
         }
         Precision::U16 => {
-            let typed_view: TypedView<u16> = TypedView::new(
-                cast::from_bytes(src.view()).unwrap(),
-                src.size(),
-                src.color().channels,
-            );
-            resize_typed(typed_view, new_size, straight_alpha, filter)
+            let resize_fn = get_resize_fn_u16(channels);
+            let src_ref = cast::from_bytes(src.view()).unwrap();
+            let buffer: Vec<u16> = resize_fn(src_ref, src_size, dst_size, resample).unwrap();
+            AlignedBuffer::new(buffer, new_size, channels)
         }
         Precision::F32 => {
-            let typed_view: TypedView<f32> = TypedView::new(
-                cast::from_bytes(src.view()).unwrap(),
-                src.size(),
-                src.color().channels,
-            );
-            resize_typed(typed_view, new_size, straight_alpha, filter)
+            let resize_fn = get_resize_fn_f32(channels);
+            let src_ref = cast::from_bytes(src.view()).unwrap();
+            let buffer: Vec<f32> = resize_fn(src_ref, src_size, dst_size, resample).unwrap();
+            AlignedBuffer::new(buffer, new_size, channels)
         }
     }
 }
-fn resize_typed<P: Copy + WithResizeFn + ToBacking + WithPrecision + PremultipliedAlpha>(
-    src: TypedView<P>,
-    new_size: Size,
-    straight_alpha: bool,
-    filter: ResizeFilter,
-) -> AlignedBuffer {
-    let resize_fn = P::get_resize_fn(src.channels);
 
-    let needs_premultiply =
-        straight_alpha && src.channels == Channels::Rgba && filter != ResizeFilter::Nearest;
-
-    let src_buffer = if needs_premultiply {
-        let mut buf = src.source.to_vec();
-        P::premultiply_rgba(buf.as_mut_slice());
-        Cow::Owned(buf)
-    } else {
-        Cow::Borrowed(src.source)
-    };
-
-    let mut buffer = resize_fn(
-        src_buffer.as_ref(),
-        to_image_size(src.size),
-        to_image_size(new_size),
-        to_resampling_function(filter),
-    )
-    .unwrap();
-
-    if needs_premultiply {
-        P::unpremultiply_rgba(buffer.as_mut_slice());
+pub(crate) fn premultiply_rgba(buffer: &mut AlignedBuffer) {
+    debug_assert_eq!(buffer.color().channels, Channels::Rgba);
+    match &mut buffer.buffer {
+        Backing::U8(v) => pic_scale_safe::premultiply_rgba8(v.as_mut_slice()),
+        Backing::U16(v) => pic_scale_safe::premultiply_rgba16(v.as_mut_slice(), 16),
+        Backing::F32(v) => pic_scale_safe::premultiply_rgba_f32(v.as_mut_slice()),
     }
-
-    let backing = P::to_backing(buffer);
-
-    AlignedBuffer::new(
-        backing,
-        new_size,
-        ColorFormat::new(src.channels, P::PRECISION),
-    )
+}
+pub(crate) fn unpremultiply_rgba(buffer: &mut AlignedBuffer) {
+    debug_assert_eq!(buffer.color().channels, Channels::Rgba);
+    match &mut buffer.buffer {
+        Backing::U8(v) => pic_scale_safe::unpremultiply_rgba8(v.as_mut_slice()),
+        Backing::U16(v) => pic_scale_safe::unpremultiply_rgba16(v.as_mut_slice(), 16),
+        Backing::F32(v) => pic_scale_safe::unpremultiply_rgba_f32(v.as_mut_slice()),
+    }
 }
 
 fn get_aligned_slice(buffer: &mut Vec<AlignTo>, size: Size, color: ColorFormat) -> &mut [u8] {
@@ -217,132 +262,32 @@ fn is_aligned(slice: &[u8], alignment: usize) -> bool {
     (slice.as_ptr() as usize) % alignment == 0
 }
 
-struct TypedView<'a, P> {
-    source: &'a [P],
-    size: Size,
-    channels: Channels,
-}
-impl<'a, P> TypedView<'a, P> {
-    pub fn new(source: &'a [P], size: Size, channels: Channels) -> Self {
-        debug_assert_eq!(
-            source.len(),
-            (size.width as usize)
-                .checked_mul(size.height as usize)
-                .and_then(|v| v.checked_mul(channels.count() as usize))
-                .expect("size too big for typed image")
-        );
-
-        Self {
-            source,
-            size,
-            channels,
-        }
-    }
-}
-
 type ResizeFn<T> = fn(&[T], ImageSize, ImageSize, ResamplingFunction) -> Result<Vec<T>, String>;
-trait WithResizeFn: Sized {
-    fn get_resize_fn(channels: Channels) -> ResizeFn<Self>;
-}
-impl WithResizeFn for u8 {
-    fn get_resize_fn(channels: Channels) -> ResizeFn<Self> {
-        match channels {
-            Channels::Alpha | Channels::Grayscale => pic_scale_safe::resize_plane8,
-            Channels::Rgb => pic_scale_safe::resize_rgb8,
-            Channels::Rgba => pic_scale_safe::resize_rgba8,
-        }
+fn get_resize_fn_u8(channels: Channels) -> ResizeFn<u8> {
+    match channels {
+        Channels::Alpha | Channels::Grayscale => pic_scale_safe::resize_plane8,
+        Channels::Rgb => pic_scale_safe::resize_rgb8,
+        Channels::Rgba => pic_scale_safe::resize_rgba8,
     }
 }
-impl WithResizeFn for u16 {
-    fn get_resize_fn(channels: Channels) -> ResizeFn<Self> {
-        match channels {
-            Channels::Alpha | Channels::Grayscale => {
-                |source, source_size, destination_size, resampling_function| {
-                    pic_scale_safe::resize_plane16(
-                        source,
-                        source_size,
-                        destination_size,
-                        16,
-                        resampling_function,
-                    )
-                }
-            }
-            Channels::Rgb => |source, source_size, destination_size, resampling_function| {
-                pic_scale_safe::resize_rgb16(
-                    source,
-                    source_size,
-                    destination_size,
-                    16,
-                    resampling_function,
-                )
-            },
-            Channels::Rgba => |source, source_size, destination_size, resampling_function| {
-                pic_scale_safe::resize_rgba16(
-                    source,
-                    source_size,
-                    destination_size,
-                    16,
-                    resampling_function,
-                )
-            },
-        }
+fn get_resize_fn_u16(channels: Channels) -> ResizeFn<u16> {
+    match channels {
+        Channels::Alpha | Channels::Grayscale => |src, src_size, dst_size, resampling_function| {
+            pic_scale_safe::resize_plane16(src, src_size, dst_size, 16, resampling_function)
+        },
+        Channels::Rgb => |src, src_size, dst_size, resampling_function| {
+            pic_scale_safe::resize_rgb16(src, src_size, dst_size, 16, resampling_function)
+        },
+        Channels::Rgba => |src, src_size, dst_size, resampling_function| {
+            pic_scale_safe::resize_rgba16(src, src_size, dst_size, 16, resampling_function)
+        },
     }
 }
-impl WithResizeFn for f32 {
-    fn get_resize_fn(channels: Channels) -> ResizeFn<Self> {
-        match channels {
-            Channels::Alpha | Channels::Grayscale => pic_scale_safe::resize_plane_f32,
-            Channels::Rgb => pic_scale_safe::resize_rgb_f32,
-            Channels::Rgba => pic_scale_safe::resize_rgba_f32,
-        }
-    }
-}
-
-trait ToBacking: Sized {
-    fn to_backing(vec: Vec<Self>) -> Backing;
-}
-impl ToBacking for u8 {
-    fn to_backing(vec: Vec<Self>) -> Backing {
-        Backing::U8(vec)
-    }
-}
-impl ToBacking for u16 {
-    fn to_backing(vec: Vec<Self>) -> Backing {
-        Backing::U16(vec)
-    }
-}
-impl ToBacking for f32 {
-    fn to_backing(vec: Vec<Self>) -> Backing {
-        Backing::F32(vec)
-    }
-}
-
-trait PremultipliedAlpha: Sized {
-    fn premultiply_rgba(slice: &mut [Self]);
-    fn unpremultiply_rgba(slice: &mut [Self]);
-}
-impl PremultipliedAlpha for u8 {
-    fn premultiply_rgba(slice: &mut [Self]) {
-        pic_scale_safe::premultiply_rgba8(slice);
-    }
-    fn unpremultiply_rgba(slice: &mut [Self]) {
-        pic_scale_safe::unpremultiply_rgba8(slice);
-    }
-}
-impl PremultipliedAlpha for u16 {
-    fn premultiply_rgba(slice: &mut [Self]) {
-        pic_scale_safe::premultiply_rgba16(slice, 16);
-    }
-    fn unpremultiply_rgba(slice: &mut [Self]) {
-        pic_scale_safe::unpremultiply_rgba16(slice, 16);
-    }
-}
-impl PremultipliedAlpha for f32 {
-    fn premultiply_rgba(slice: &mut [Self]) {
-        pic_scale_safe::premultiply_rgba_f32(slice);
-    }
-    fn unpremultiply_rgba(slice: &mut [Self]) {
-        pic_scale_safe::unpremultiply_rgba_f32(slice);
+fn get_resize_fn_f32(channels: Channels) -> ResizeFn<f32> {
+    match channels {
+        Channels::Alpha | Channels::Grayscale => pic_scale_safe::resize_plane_f32,
+        Channels::Rgb => pic_scale_safe::resize_rgb_f32,
+        Channels::Rgba => pic_scale_safe::resize_rgba_f32,
     }
 }
 

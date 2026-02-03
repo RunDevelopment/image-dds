@@ -1,36 +1,36 @@
 base @ straight-alpha - Box.png: >
-    42d9db52df97d460c35cdeaf07cba92a84de2ba1e18e0cd5415abda16aae04ab
+    6926df9890f31aee457be2f79fa2472121b6afe3bf1184d5dacf54b8bc7d7361
 
 base @ no-straight-alpha - Box.png: >
-    c5a489502b956d81ee366e6c4bfc708d8c7fe3671af41cc31c2f9c57872b6e5c
+    4e8a76e8bfc744d5180544bb9c85b7b79e03a8be4ee5da6bbb0b17ae124cc455
 
 base @ straight-alpha - Nearest.png: >
-    87cfc13df79b2864edab2507b8da67ab15281f0784ef3b82947bb33c61ef30af
+    5c8c41da215c163515e6b6ea82ec13318e5539b2c7d9573664106c759f1c4efa
 
 base @ straight-alpha - Triangle.png: >
-    de10427f60f44b5ab6f3e29c73779bc47dcfd948bbc14f153111fb44445f5bcc
+    bc1c4f725c4dd18e8761a69b8f760c35e20b1679a3001da1f268032d8d82419e
 
 base @ straight-alpha - Mitchell.png: >
-    21cdc56a6eea67ef4861f9b226713a2d438187be4b55c735430764970729eaba
+    1243c6941e46b144974820cbe2b0589c865ab11ff04558a5b369c1234f0af922
 
 base @ straight-alpha - Lanczos3.png: >
-    50ce5bf37b01ec925c5a2188dfdf83be0e4ff0060923261e030741a1b0025e30
+    7f07932404b9a1ba377c25d858ae45a8e6e7470523ca5da20fe6e601972f18af
 
 bricks-d @ straight-alpha - Box.png: >
-    3b615f955e1bb504ba1d7c08ed948926fbbc39d78f2b211c655f33afb7ec633b
+    19f1825e7b597daa76351c5051e4d53db8f3506229856173a708dc15d4ccf7f1
 
 bricks-d @ no-straight-alpha - Box.png: >
-    3b615f955e1bb504ba1d7c08ed948926fbbc39d78f2b211c655f33afb7ec633b
+    19f1825e7b597daa76351c5051e4d53db8f3506229856173a708dc15d4ccf7f1
 
 bricks-d @ straight-alpha - Nearest.png: >
-    9ce443a23c8483064d2ef4ac494397c94a0954a0c4833f9934df0252c3ffea56
+    4111a3252c849ca6deeeba72928b1aae2ce63edb55c785bb3ba2ba25e4d524a4
 
 bricks-d @ straight-alpha - Triangle.png: >
-    f1db1ac5255e309ee51d6fb1bdf1d45288a3161ed0f02629e7ac2fac90f88247
+    782faa1699d365b1d5f4131070435f6c5f88964a1f7488890b58f7d8891bc3b6
 
 bricks-d @ straight-alpha - Mitchell.png: >
-    d298d727e988a53adaf9d4ffe2b9752046e434cef024667004d9f88412d673c7
+    6bb2e1569f7b4a69f39a2431f4cf2f40a2125acbaf0415394d8d465f510d43e9
 
 bricks-d @ straight-alpha - Lanczos3.png: >
-    c1442ac7b53cc5c6531900bcabf63509fadeaafdd26ae9e61a78f29397f4ec34
+    cfa810d8f26182bbba84143c4c8a4065dea7cbdf497a25775efcce832c3fb8f8
 
