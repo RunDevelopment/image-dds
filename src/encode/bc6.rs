@@ -1,3 +1,5 @@
+#![allow(clippy::needless_range_loop)]
+
 use bitflags::bitflags;
 use glam::Vec3A;
 
