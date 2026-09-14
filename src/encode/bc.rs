@@ -472,7 +472,7 @@ fn get_bc6_options(options: &EncodeOptions, format: bc6::BC6HFormat) -> bc6::Bc6
 }
 pub(crate) const BC6H_UF16: EncoderSet = EncoderSet::new_bc(&[Encoder::new_universal(|args| {
     block_4x4::<16>(args, |data, row_pitch, options, out| {
-        let block = get_4x4_rgba_vec4(data, row_pitch).map(Vec3A::from);
+        let block = get_4x4_rgba_vec4(data, row_pitch).map(Vec3A::from_vec4);
         let options = get_bc6_options(options, bc6::BC6HFormat::UnsignedF16);
         *out = bc6::compress_bc6_block(block, options);
     })
@@ -480,7 +480,7 @@ pub(crate) const BC6H_UF16: EncoderSet = EncoderSet::new_bc(&[Encoder::new_unive
 .with_fragment_size(BC6_FRAGMENT_SIZE)]);
 pub(crate) const BC6H_SF16: EncoderSet = EncoderSet::new_bc(&[Encoder::new_universal(|args| {
     block_4x4::<16>(args, |data, row_pitch, options, out| {
-        let block = get_4x4_rgba_vec4(data, row_pitch).map(Vec3A::from);
+        let block = get_4x4_rgba_vec4(data, row_pitch).map(Vec3A::from_vec4);
         let options = get_bc6_options(options, bc6::BC6HFormat::SignedF16);
         *out = bc6::compress_bc6_block(block, options);
     })
